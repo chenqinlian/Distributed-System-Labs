@@ -24,5 +24,31 @@ func (mr *Master) schedule(phase jobPhase) {
 	//
 	// TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
 	//
+
+	done := make(chan int, ntasks)
+
+	for i := 0; i < ntasks; i++ {
+		go func(idx int) {
+			for {
+				var file string
+				if phase == mapPhase {
+					file = mr.files[idx]
+				}
+				w := <-mr.registerChannel
+				if call(w,
+					"Worker.DoTask",
+					DoTaskArgs{mr.jobName, file, phase, idx, nios},
+					nil) {
+					done <- 0
+					mr.registerChannel <- w
+					break
+				}
+			}
+		}(i)
+	}
+	for i := 0; i < ntasks; i++ {
+		<-done
+	}
+
 	fmt.Printf("Schedule: %v phase done\n", phase)
 }
