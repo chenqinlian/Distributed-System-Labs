@@ -19,9 +19,11 @@ package raft
 
 import "sync"
 import "labrpc"
-
-// import "bytes"
-// import "encoding/gob"
+import "math/rand"
+import "time"
+import "fmt"
+import "bytes"
+import "encoding/gob"
 
 
 
@@ -37,29 +39,69 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+type ServerState int
+
+const (
+    FOLLOWER = iota
+    CANDIDATE = iota
+    LEADER = iota
+)
+
+func (state ServerState) String() string {
+    switch (state) {
+    case FOLLOWER:
+        return "FOLLOWER"
+    case CANDIDATE:
+        return "CANDIDATE"
+    case LEADER:
+        return "LEADER"
+    }
+    return "UNKNOWN"
+}
+
+type LogEntry struct {
+    Command         interface{}
+    Term            int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex
-	peers     []*labrpc.ClientEnd
-	persister *Persister
-	me        int // index into peers[]
+	peers           []*labrpc.ClientEnd
+	persister       *Persister
+	me              int // index into peers[]
 
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+    mutex           sync.Mutex
+    state           ServerState
+    timer           *time.Timer
+    applyCh         chan ApplyMsg
 
+    Term            int
+    VotedFor        int
+    Log             []LogEntry
+
+    commitIdx       int
+    lastApplied     int
+
+    nextIdx         []int
+    matchIdx        []int
+}
+
+func (rf Raft) String() string {
+    return fmt.Sprintf("Server_%d (term %d, %s)", rf.me, rf.Term, rf.state.String())
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here.
-	return term, isleader
+    rf.mutex.Lock()
+    defer rf.mutex.Unlock()
+	return rf.Term, rf.state == LEADER
 }
 
 //
@@ -76,6 +118,12 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+    buffer := new(bytes.Buffer)
+    encoder := gob.NewEncoder(buffer)
+    encoder.Encode(rf.Term)
+    encoder.Encode(rf.VotedFor)
+    encoder.Encode(rf.Log)
+    rf.persister.SaveRaftState(buffer.Bytes())
 }
 
 //
@@ -88,16 +136,22 @@ func (rf *Raft) readPersist(data []byte) {
 	// d := gob.NewDecoder(r)
 	// d.Decode(&rf.xxx)
 	// d.Decode(&rf.yyy)
+    buffer := bytes.NewBuffer(data)
+    decoder := gob.NewDecoder(buffer)
+    decoder.Decode(&rf.Term)
+    decoder.Decode(&rf.VotedFor)
+    decoder.Decode(&rf.Log)
 }
-
-
-
 
 //
 // example RequestVote RPC arguments structure.
 //
 type RequestVoteArgs struct {
 	// Your data here.
+    Term            int
+    CandidateId     int
+    LastLogIdx      int
+    LastLogTerm     int
 }
 
 //
@@ -105,6 +159,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here.
+    VoteGranted     bool
+    Term            int
 }
 
 //
@@ -112,6 +168,20 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
+    rf.mutex.Lock()
+    defer rf.mutex.Unlock()
+    if args.Term < rf.Term ||
+        (args.Term == rf.Term && rf.VotedFor >= 0 && args.CandidateId != rf.VotedFor) ||
+        args.LastLogTerm < rf.Log[len(rf.Log)-1].Term ||
+        (args.LastLogTerm == rf.Log[len(rf.Log)-1].Term && args.LastLogIdx < len(rf.Log)-1) {
+        reply.VoteGranted = false
+    } else {
+        if args.Term > rf.Term {
+            rf.stepDown(args.Term, args.CandidateId)
+        }
+        reply.VoteGranted = true
+    }
+    reply.Term = rf.Term
 }
 
 //
@@ -132,8 +202,80 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+	return rf.peers[server].Call("Raft.RequestVote", args, reply)
+}
+
+type AppendEntriesArgs struct {
+    Term            int
+    LeaderId        int
+    PrevLogIdx      int
+    PrevLogTerm     int
+    Entries         []LogEntry
+    LeaderCommit    int
+}
+
+func (args AppendEntriesArgs) String() string {
+    return fmt.Sprintf("AppendEntriesArgs(from Server_%d, term %d, PrevLogIdx=%d, PrevLogTerm=%d)",
+        args.LeaderId, args.Term, args.PrevLogIdx, args.PrevLogTerm)
+}
+
+type AppendEntriesReply struct {
+    Success         bool
+    Term            int
+    Index           int
+}
+
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+    rf.mutex.Lock()
+    defer rf.mutex.Unlock()
+    if args.Term < rf.Term {
+        reply.Success = false
+    } else {
+        if args.Term > rf.Term  || CANDIDATE == rf.state {
+            rf.stepDown(args.Term, -1)
+        } else {
+            rf.resetTimer()
+        }
+        if args.PrevLogIdx >= len(rf.Log) {
+            reply.Index = len(rf.Log)-1
+            reply.Success = false
+        } else if rf.Log[args.PrevLogIdx].Term != args.PrevLogTerm {
+            for i:=args.PrevLogIdx-1; i>=0; i-- {
+                if rf.Log[i].Term != rf.Log[args.PrevLogIdx].Term {
+                    reply.Index = i
+                    break
+                }
+            }
+            reply.Success = false
+        } else {
+            if rf.matchIdx[rf.me] < args.PrevLogIdx+len(args.Entries) {
+                for i,j := args.PrevLogIdx+1, 0; ; i,j = i+1, j+1 {
+                    if i == len(rf.Log) || j == len(args.Entries) || rf.Log[i].Term != args.Entries[j].Term {
+                        rf.Log = append(rf.Log[:i], args.Entries[j:]...)
+                        rf.persist()
+                        break
+                    }
+                }
+                rf.matchIdx[rf.me] = len(rf.Log)-1
+                rf.commitIdx = len(rf.Log)-1
+            } else if rf.commitIdx < args.PrevLogIdx {
+                rf.commitIdx = args.PrevLogIdx
+            }
+            if rf.commitIdx > args.LeaderCommit {
+                rf.commitIdx = args.LeaderCommit
+            }
+            for rf.lastApplied < rf.commitIdx {
+                rf.lastApplied++
+                rf.applyCh <- ApplyMsg{rf.lastApplied, rf.Log[rf.lastApplied].Command, false, nil}
+            }
+            reply.Success = true
+        }
+    }
+    reply.Term = rf.Term
+}
+
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
+    return rf.peers[server].Call("Raft.AppendEntries", args, reply)
 }
 
 
@@ -151,12 +293,15 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-
-	return index, term, isLeader
+    rf.mutex.Lock()
+    defer rf.mutex.Unlock()
+    index := len(rf.Log)
+    if LEADER == rf.state {
+        rf.Log = append(rf.Log, LogEntry{command, rf.Term})
+        rf.persist()
+        go rf.broadcastAppendEntries(rf.Term)
+    }
+    return index, rf.Term, LEADER == rf.state
 }
 
 //
@@ -167,6 +312,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+    rf.mutex.Lock()
+    rf.Term = (1<<31)-1
+    rf.state = FOLLOWER
+    rf.mutex.Unlock()
 }
 
 //
@@ -188,10 +337,189 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here.
+    rand.Seed(time.Now().UnixNano())
+
+    rf.mutex.Lock()
+    rf.timer = time.NewTimer(time.Millisecond * time.Duration(150+rand.Intn(150)))
+    rf.applyCh = applyCh
+
+    rf.commitIdx = 0
+    rf.lastApplied = 0
+    rf.nextIdx = make([]int, len(rf.peers))
+    rf.matchIdx = make([]int, len(rf.peers))
+
+    rf.VotedFor = -1
+    rf.Log = []LogEntry{LogEntry{Term:0}}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+    rf.mutex.Unlock()
 
+    go rf.watchdog()
 
 	return rf
 }
+
+func (rf *Raft) resetTimer() {
+    switch rf.state {
+    case FOLLOWER, CANDIDATE:
+        rf.timer.Reset(time.Millisecond * time.Duration(150+rand.Intn(150)))
+    case LEADER:
+        rf.timer.Reset(time.Millisecond * time.Duration(50))
+    }
+}
+
+func (rf *Raft) watchdog() {
+    for {
+        <-rf.timer.C
+        rf.mutex.Lock()
+        switch rf.state {
+        case FOLLOWER:
+            rf.Term++
+            rf.VotedFor = rf.me
+            rf.state = CANDIDATE
+            rf.persist()
+            go rf.broadcastRequestVote()
+        case CANDIDATE:
+            rf.Term++
+            rf.persist()
+            go rf.broadcastRequestVote()
+        case LEADER:
+            go rf.broadcastHeartbeats()
+        }
+        rf.resetTimer()
+        rf.mutex.Unlock()
+    }
+}
+
+func (rf *Raft) stepDown(term int, votedFor int) {
+    rf.Term = term
+    rf.VotedFor = votedFor
+    rf.state = FOLLOWER
+    rf.persist()
+    rf.matchIdx[rf.me] = 0
+    rf.resetTimer()
+}
+
+func (rf *Raft) broadcastRequestVote() {
+    votes := 1
+    for server := range rf.peers {
+        if server != rf.me {
+            go func(idx int) {
+                rf.mutex.Lock()
+                defer rf.mutex.Unlock()
+                args := RequestVoteArgs{rf.Term, rf.me, len(rf.Log)-1, rf.Log[len(rf.Log)-1].Term}
+                reply := RequestVoteReply{}
+
+                for replied:=false; CANDIDATE == rf.state && !replied; {
+                    rf.mutex.Unlock()
+                    replied = rf.sendRequestVote(idx, args, &reply)
+                    rf.mutex.Lock()
+                }
+
+                if CANDIDATE == rf.state {
+                    if reply.Term > rf.Term {
+                        rf.stepDown(reply.Term, -1)
+                    } else if reply.VoteGranted {
+                        votes++
+                        if votes == len(rf.peers)/2+1 {
+                            rf.state = LEADER
+                            rf.resetTimer()
+                            for i := range rf.peers {
+                                rf.nextIdx[i] = len(rf.Log)
+                                rf.matchIdx[i] = 0
+                            }
+                            go rf.broadcastHeartbeats()
+                        }
+                    }
+                }
+            }(server)
+        }
+    }
+}
+
+func (rf *Raft) broadcastHeartbeats() {
+    for server := range rf.peers {
+        if server != rf.me {
+            go func(idx int) {
+                rf.mutex.Lock()
+                args := AppendEntriesArgs{rf.Term, rf.me, rf.nextIdx[idx]-1,
+                    rf.Log[rf.nextIdx[idx]-1].Term, []LogEntry{},  rf.commitIdx}
+                rf.mutex.Unlock()
+                reply := AppendEntriesReply{}
+
+                if rf.sendAppendEntries(idx, args, &reply) {
+                    rf.mutex.Lock()
+                    if args.Term == rf.Term {
+                        if reply.Success {
+                            if rf.matchIdx[idx] < args.PrevLogIdx {
+                                rf.matchIdx[idx] = args.PrevLogIdx
+                            }
+                        } else if rf.Term < reply.Term {
+                            rf.stepDown(reply.Term, -1)
+                        } else if args.PrevLogIdx == rf.nextIdx[idx]-1 {
+                            rf.nextIdx[idx] = reply.Index+1
+                        }
+                    }
+                    rf.mutex.Unlock()
+                }
+            }(server)
+        }
+    }
+}
+
+func (rf *Raft) broadcastAppendEntries(term int) {
+    for server := range rf.peers {
+        if server != rf.me {
+            go func(idx int) {
+                rf.mutex.Lock()
+                defer rf.mutex.Unlock()
+                args := AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1, rf.Log[rf.nextIdx[idx]-1].Term,
+                    rf.Log[rf.nextIdx[idx]:],  rf.commitIdx}
+
+                for stop:=false; !stop; {
+                    stop = true
+                    reply := AppendEntriesReply{}
+
+                    for replied:=false; term == rf.Term && !replied; {
+                        rf.mutex.Unlock()
+                        replied = rf.sendAppendEntries(idx, args, &reply)
+                        rf.mutex.Lock()
+                    }
+
+                    if term == rf.Term {
+                        if reply.Success {
+                            if rf.matchIdx[idx] < args.PrevLogIdx+len(args.Entries) {
+                                rf.matchIdx[idx] = args.PrevLogIdx+len(args.Entries)
+                                rf.nextIdx[idx] = rf.matchIdx[idx]+1
+                                if term == rf.Log[rf.matchIdx[idx]].Term && rf.commitIdx < rf.matchIdx[idx] {
+                                    cnt := 1
+                                    for i := range rf.peers {
+                                        if i != rf.me && rf.matchIdx[i] >= rf.matchIdx[idx] {
+                                            cnt++
+                                        }
+                                    }
+                                    if cnt == len(rf.peers)/2+1 {
+                                        rf.commitIdx = rf.matchIdx[idx]
+                                        for rf.lastApplied < rf.commitIdx {
+                                            rf.lastApplied++
+                                            rf.applyCh <- ApplyMsg{rf.lastApplied, rf.Log[rf.lastApplied].Command, false, nil}
+                                        }
+                                    }
+                                }
+                            }
+                        } else if rf.Term < reply.Term {
+                            rf.stepDown(reply.Term, -1)
+                        } else if args.PrevLogIdx == rf.nextIdx[idx]-1 {
+                            rf.nextIdx[idx] = reply.Index+1
+                            args = AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1, rf.Log[rf.nextIdx[idx]-1].Term,
+                                rf.Log[rf.nextIdx[idx]:], rf.commitIdx}
+                            stop = false
+                        }
+                    }
+                }
+            }(server)
+        }
+    }
+}
+
