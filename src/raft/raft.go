@@ -136,11 +136,13 @@ func (rf *Raft) readPersist(data []byte) {
 	// d := gob.NewDecoder(r)
 	// d.Decode(&rf.xxx)
 	// d.Decode(&rf.yyy)
-    buffer := bytes.NewBuffer(data)
-    decoder := gob.NewDecoder(buffer)
-    decoder.Decode(&rf.Term)
-    decoder.Decode(&rf.VotedFor)
-    decoder.Decode(&rf.Log)
+    if 0 != len(data) {
+        buffer := bytes.NewBuffer(data)
+        decoder := gob.NewDecoder(buffer)
+        decoder.Decode(&rf.Term)
+        decoder.Decode(&rf.VotedFor)
+        decoder.Decode(&rf.Log)
+    }
 }
 
 //
@@ -176,9 +178,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
         (args.LastLogTerm == rf.Log[len(rf.Log)-1].Term && args.LastLogIdx < len(rf.Log)-1) {
         reply.VoteGranted = false
     } else {
-        if args.Term > rf.Term {
-            rf.stepDown(args.Term, args.CandidateId)
-        }
+        rf.stepDown(args.Term, args.CandidateId)
         reply.VoteGranted = true
     }
     reply.Term = rf.Term
@@ -234,6 +234,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
         if args.Term > rf.Term  || CANDIDATE == rf.state {
             rf.stepDown(args.Term, -1)
         } else {
+            Assert(LEADER != rf.state, "%s receives request from %d", rf, args.LeaderId)
             rf.resetTimer()
         }
         if args.PrevLogIdx >= len(rf.Log) {
@@ -313,7 +314,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
     rf.mutex.Lock()
-    rf.Term = (1<<31)-1
+    rf.Term = -1
     rf.state = FOLLOWER
     rf.mutex.Unlock()
 }
@@ -360,6 +361,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+func (rf *Raft) stepDown(term int, votedFor int) {
+    rf.Term = term
+    rf.VotedFor = votedFor
+    rf.state = FOLLOWER
+    rf.persist()
+    rf.matchIdx[rf.me] = 0
+    rf.resetTimer()
+}
+
 func (rf *Raft) resetTimer() {
     switch rf.state {
     case FOLLOWER, CANDIDATE:
@@ -379,45 +389,36 @@ func (rf *Raft) watchdog() {
             rf.VotedFor = rf.me
             rf.state = CANDIDATE
             rf.persist()
-            go rf.broadcastRequestVote()
+            go rf.broadcastRequestVote(rf.Term)
         case CANDIDATE:
             rf.Term++
             rf.persist()
-            go rf.broadcastRequestVote()
+            go rf.broadcastRequestVote(rf.Term)
         case LEADER:
-            go rf.broadcastHeartbeats()
+            go rf.broadcastHeartbeats(rf.Term)
         }
         rf.resetTimer()
         rf.mutex.Unlock()
     }
 }
 
-func (rf *Raft) stepDown(term int, votedFor int) {
-    rf.Term = term
-    rf.VotedFor = votedFor
-    rf.state = FOLLOWER
-    rf.persist()
-    rf.matchIdx[rf.me] = 0
-    rf.resetTimer()
-}
-
-func (rf *Raft) broadcastRequestVote() {
+func (rf *Raft) broadcastRequestVote(term int) {
     votes := 1
     for server := range rf.peers {
         if server != rf.me {
             go func(idx int) {
                 rf.mutex.Lock()
                 defer rf.mutex.Unlock()
-                args := RequestVoteArgs{rf.Term, rf.me, len(rf.Log)-1, rf.Log[len(rf.Log)-1].Term}
+                args := RequestVoteArgs{term, rf.me, len(rf.Log)-1, rf.Log[len(rf.Log)-1].Term}
                 reply := RequestVoteReply{}
 
-                for replied:=false; CANDIDATE == rf.state && !replied; {
+                for replied:=false; term == rf.Term && CANDIDATE == rf.state && !replied; {
                     rf.mutex.Unlock()
                     replied = rf.sendRequestVote(idx, args, &reply)
                     rf.mutex.Lock()
                 }
 
-                if CANDIDATE == rf.state {
+                if term == rf.Term && CANDIDATE == rf.state {
                     if reply.Term > rf.Term {
                         rf.stepDown(reply.Term, -1)
                     } else if reply.VoteGranted {
@@ -425,11 +426,12 @@ func (rf *Raft) broadcastRequestVote() {
                         if votes == len(rf.peers)/2+1 {
                             rf.state = LEADER
                             rf.resetTimer()
+                            //DPrintf("LEADER = %s", rf)
                             for i := range rf.peers {
                                 rf.nextIdx[i] = len(rf.Log)
                                 rf.matchIdx[i] = 0
                             }
-                            go rf.broadcastHeartbeats()
+                            go rf.broadcastHeartbeats(rf.Term)
                         }
                     }
                 }
@@ -438,22 +440,25 @@ func (rf *Raft) broadcastRequestVote() {
     }
 }
 
-func (rf *Raft) broadcastHeartbeats() {
+func (rf *Raft) broadcastHeartbeats(term int) {
     for server := range rf.peers {
         if server != rf.me {
             go func(idx int) {
                 rf.mutex.Lock()
-                args := AppendEntriesArgs{rf.Term, rf.me, rf.nextIdx[idx]-1,
-                    rf.Log[rf.nextIdx[idx]-1].Term, []LogEntry{},  rf.commitIdx}
-                rf.mutex.Unlock()
-                reply := AppendEntriesReply{}
+                defer rf.mutex.Unlock()
+                if term == rf.Term {
+                    args := AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1,
+                        rf.Log[rf.nextIdx[idx]-1].Term, []LogEntry{},  rf.commitIdx}
+                    reply := AppendEntriesReply{}
 
-                if rf.sendAppendEntries(idx, args, &reply) {
+                    rf.mutex.Unlock()
+                    replied := rf.sendAppendEntries(idx, args, &reply)
                     rf.mutex.Lock()
-                    if args.Term == rf.Term {
+                    if replied && term == rf.Term {
                         if reply.Success {
                             if rf.matchIdx[idx] < args.PrevLogIdx {
                                 rf.matchIdx[idx] = args.PrevLogIdx
+                                rf.nextIdx[idx] = args.PrevLogIdx+1
                             }
                         } else if rf.Term < reply.Term {
                             rf.stepDown(reply.Term, -1)
@@ -461,7 +466,6 @@ func (rf *Raft) broadcastHeartbeats() {
                             rf.nextIdx[idx] = reply.Index+1
                         }
                     }
-                    rf.mutex.Unlock()
                 }
             }(server)
         }
@@ -474,47 +478,52 @@ func (rf *Raft) broadcastAppendEntries(term int) {
             go func(idx int) {
                 rf.mutex.Lock()
                 defer rf.mutex.Unlock()
-                args := AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1, rf.Log[rf.nextIdx[idx]-1].Term,
-                    rf.Log[rf.nextIdx[idx]:],  rf.commitIdx}
+                if term == rf.Term {
+                    rf.checkNextIdx(idx)
+                    args := AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1, rf.Log[rf.nextIdx[idx]-1].Term,
+                        rf.Log[rf.nextIdx[idx]:],  rf.commitIdx}
 
-                for stop:=false; !stop; {
-                    stop = true
-                    reply := AppendEntriesReply{}
+                    for stop:=false; !stop; {
+                        stop = true
+                        reply := AppendEntriesReply{}
 
-                    for replied:=false; term == rf.Term && !replied; {
-                        rf.mutex.Unlock()
-                        replied = rf.sendAppendEntries(idx, args, &reply)
-                        rf.mutex.Lock()
-                    }
+                        for replied:=false; term == rf.Term && !replied; {
+                            rf.mutex.Unlock()
+                            replied = rf.sendAppendEntries(idx, args, &reply)
+                            rf.mutex.Lock()
+                        }
 
-                    if term == rf.Term {
-                        if reply.Success {
-                            if rf.matchIdx[idx] < args.PrevLogIdx+len(args.Entries) {
-                                rf.matchIdx[idx] = args.PrevLogIdx+len(args.Entries)
-                                rf.nextIdx[idx] = rf.matchIdx[idx]+1
-                                if term == rf.Log[rf.matchIdx[idx]].Term && rf.commitIdx < rf.matchIdx[idx] {
-                                    cnt := 1
-                                    for i := range rf.peers {
-                                        if i != rf.me && rf.matchIdx[i] >= rf.matchIdx[idx] {
-                                            cnt++
+                        if term == rf.Term {
+                            if reply.Success {
+                                if rf.matchIdx[idx] < args.PrevLogIdx+len(args.Entries) {
+                                    rf.matchIdx[idx] = args.PrevLogIdx+len(args.Entries)
+                                    rf.nextIdx[idx] = rf.matchIdx[idx]+1
+                                    rf.checkNextIdx(idx)
+                                    if term == rf.Log[rf.matchIdx[idx]].Term && rf.commitIdx < rf.matchIdx[idx] {
+                                        cnt := 1
+                                        for i := range rf.peers {
+                                            if i != rf.me && rf.matchIdx[i] >= rf.matchIdx[idx] {
+                                                cnt++
+                                            }
                                         }
-                                    }
-                                    if cnt == len(rf.peers)/2+1 {
-                                        rf.commitIdx = rf.matchIdx[idx]
-                                        for rf.lastApplied < rf.commitIdx {
-                                            rf.lastApplied++
-                                            rf.applyCh <- ApplyMsg{rf.lastApplied, rf.Log[rf.lastApplied].Command, false, nil}
+                                        if cnt == len(rf.peers)/2+1 {
+                                            rf.commitIdx = rf.matchIdx[idx]
+                                            for rf.lastApplied < rf.commitIdx {
+                                                rf.lastApplied++
+                                                rf.applyCh <- ApplyMsg{rf.lastApplied, rf.Log[rf.lastApplied].Command, false, nil}
+                                            }
                                         }
                                     }
                                 }
+                            } else if rf.Term < reply.Term {
+                                rf.stepDown(reply.Term, -1)
+                            } else if args.PrevLogIdx == rf.nextIdx[idx]-1 {
+                                rf.nextIdx[idx] = reply.Index+1
+                                rf.checkNextIdx(idx)
+                                args = AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1, rf.Log[rf.nextIdx[idx]-1].Term,
+                                    rf.Log[rf.nextIdx[idx]:], rf.commitIdx}
+                                stop = false
                             }
-                        } else if rf.Term < reply.Term {
-                            rf.stepDown(reply.Term, -1)
-                        } else if args.PrevLogIdx == rf.nextIdx[idx]-1 {
-                            rf.nextIdx[idx] = reply.Index+1
-                            args = AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1, rf.Log[rf.nextIdx[idx]-1].Term,
-                                rf.Log[rf.nextIdx[idx]:], rf.commitIdx}
-                            stop = false
                         }
                     }
                 }
@@ -522,4 +531,3 @@ func (rf *Raft) broadcastAppendEntries(term int) {
         }
     }
 }
-
