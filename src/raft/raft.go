@@ -17,15 +17,15 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
-import "math/rand"
-import "time"
-import "fmt"
-import "bytes"
-import "encoding/gob"
-
-
+import (
+    "sync"
+    "labrpc"
+    "math/rand"
+    "time"
+    "fmt"
+    "bytes"
+    "encoding/gob"
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -42,9 +42,9 @@ type ApplyMsg struct {
 type ServerState int
 
 const (
-    FOLLOWER = iota
-    CANDIDATE = iota
-    LEADER = iota
+    FOLLOWER    = iota
+    CANDIDATE   = iota
+    LEADER      = iota
 )
 
 func (state ServerState) String() string {
@@ -78,11 +78,15 @@ type Raft struct {
     mutex           sync.Mutex
     state           ServerState
     timer           *time.Timer
+    msg_cond        sync.Cond
+    msg_q           []ApplyMsg
     applyCh         chan ApplyMsg
+    stop            bool
 
     Term            int
     VotedFor        int
     Log             []LogEntry
+    BaseIdx         int
 
     commitIdx       int
     lastApplied     int
@@ -92,7 +96,7 @@ type Raft struct {
 }
 
 func (rf Raft) String() string {
-    return fmt.Sprintf("Server_%d (term %d, %s)", rf.me, rf.Term, rf.state.String())
+    return fmt.Sprintf("Raft_%d (term %d, %s)", rf.me, rf.Term, rf.state)
 }
 
 // return currentTerm and whether this server
@@ -109,7 +113,7 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
+func (rf *Raft) persist() { // Guarded by mutex
 	// Your code here.
 	// Example:
 	// w := new(bytes.Buffer)
@@ -123,25 +127,32 @@ func (rf *Raft) persist() {
     encoder.Encode(rf.Term)
     encoder.Encode(rf.VotedFor)
     encoder.Encode(rf.Log)
+    encoder.Encode(rf.BaseIdx)
     rf.persister.SaveRaftState(buffer.Bytes())
 }
 
 //
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte) {  // Guarded by mutex
 	// Your code here.
 	// Example:
 	// r := bytes.NewBuffer(data)
 	// d := gob.NewDecoder(r)
 	// d.Decode(&rf.xxx)
 	// d.Decode(&rf.yyy)
-    if 0 != len(data) {
+    if 0 == len(data) {
+        rf.Term = 0
+        rf.VotedFor = -1
+        rf.Log = []LogEntry{LogEntry{Term:0}}
+        rf.BaseIdx = 0
+    } else {
         buffer := bytes.NewBuffer(data)
         decoder := gob.NewDecoder(buffer)
         decoder.Decode(&rf.Term)
         decoder.Decode(&rf.VotedFor)
         decoder.Decode(&rf.Log)
+        decoder.Decode(&rf.BaseIdx)
     }
 }
 
@@ -154,6 +165,11 @@ type RequestVoteArgs struct {
     CandidateId     int
     LastLogIdx      int
     LastLogTerm     int
+}
+
+func (args RequestVoteArgs) String() string {
+    return fmt.Sprintf("RequestVoteArgs(from %v, term %v, lastLogIdx=%v, lastLogTerm=%v)",
+            args.CandidateId, args.Term, args.LastLogIdx, args.LastLogTerm)
 }
 
 //
@@ -172,10 +188,10 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
     rf.mutex.Lock()
     defer rf.mutex.Unlock()
-    if args.Term < rf.Term ||
-        (args.Term == rf.Term && rf.VotedFor >= 0 && args.CandidateId != rf.VotedFor) ||
-        args.LastLogTerm < rf.Log[len(rf.Log)-1].Term ||
-        (args.LastLogTerm == rf.Log[len(rf.Log)-1].Term && args.LastLogIdx < len(rf.Log)-1) {
+    if args.LastLogTerm < rf.Log[len(rf.Log)-1].Term ||
+        (args.LastLogTerm == rf.Log[len(rf.Log)-1].Term && args.LastLogIdx < rf.BaseIdx+len(rf.Log)-1) ||
+        args.Term < rf.Term ||
+        (args.Term == rf.Term && rf.VotedFor >= 0 && args.CandidateId != rf.VotedFor) {
         reply.VoteGranted = false
     } else {
         rf.stepDown(args.Term, args.CandidateId)
@@ -231,44 +247,38 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
     if args.Term < rf.Term {
         reply.Success = false
     } else {
+        assert(rf.commitIdx >= rf.BaseIdx, "%s: commitIdx=%v, BaseIdx=%v", rf, rf.commitIdx, rf.BaseIdx)
         if args.Term > rf.Term  || CANDIDATE == rf.state {
             rf.stepDown(args.Term, -1)
         } else {
-            Assert(LEADER != rf.state, "%s receives request from %d", rf, args.LeaderId)
+            assert(LEADER != rf.state, "%s receives request from %d", rf, args.LeaderId)
             rf.resetTimer()
         }
-        if args.PrevLogIdx >= len(rf.Log) {
-            reply.Index = len(rf.Log)-1
+        if args.PrevLogIdx >= rf.BaseIdx+len(rf.Log) {
+            reply.Index = rf.BaseIdx+len(rf.Log)-1
             reply.Success = false
-        } else if rf.Log[args.PrevLogIdx].Term != args.PrevLogTerm {
-            for i:=args.PrevLogIdx-1; i>=0; i-- {
-                if rf.Log[i].Term != rf.Log[args.PrevLogIdx].Term {
-                    reply.Index = i
+        } else if args.PrevLogIdx < rf.BaseIdx {
+            reply.Index = rf.BaseIdx
+            reply.Success = false
+        } else if rf.Log[args.PrevLogIdx-rf.BaseIdx].Term != args.PrevLogTerm {
+            for i:=args.PrevLogIdx-rf.BaseIdx-1; i>=0; i-- {
+                if rf.Log[i].Term != rf.Log[args.PrevLogIdx-rf.BaseIdx].Term {
+                    reply.Index = i+rf.BaseIdx
                     break
                 }
             }
             reply.Success = false
         } else {
-            if rf.matchIdx[rf.me] < args.PrevLogIdx+len(args.Entries) {
-                for i,j := args.PrevLogIdx+1, 0; ; i,j = i+1, j+1 {
-                    if i == len(rf.Log) || j == len(args.Entries) || rf.Log[i].Term != args.Entries[j].Term {
-                        rf.Log = append(rf.Log[:i], args.Entries[j:]...)
-                        rf.persist()
-                        break
-                    }
+            for i,j := args.PrevLogIdx+1, 0; j<len(args.Entries); i,j = i+1, j+1 {
+                if i == rf.BaseIdx+len(rf.Log) || rf.Log[i-rf.BaseIdx].Term != args.Entries[j].Term {
+                    rf.Log = append(rf.Log[:i-rf.BaseIdx], args.Entries[j:]...)
+                    rf.persist()
+                    break
                 }
-                rf.matchIdx[rf.me] = len(rf.Log)-1
-                rf.commitIdx = len(rf.Log)-1
-            } else if rf.commitIdx < args.PrevLogIdx {
-                rf.commitIdx = args.PrevLogIdx
             }
-            if rf.commitIdx > args.LeaderCommit {
-                rf.commitIdx = args.LeaderCommit
-            }
-            for rf.lastApplied < rf.commitIdx {
-                rf.lastApplied++
-                rf.applyCh <- ApplyMsg{rf.lastApplied, rf.Log[rf.lastApplied].Command, false, nil}
-            }
+            rf.commitIdx = max(rf.commitIdx, min(args.LeaderCommit, args.PrevLogIdx+len(args.Entries)))
+            assert(rf.commitIdx >= rf.BaseIdx, "%s: commitIdx=%v, BaseIdx=%v", rf, rf.commitIdx, rf.BaseIdx)
+            rf.apply()
             reply.Success = true
         }
     }
@@ -279,6 +289,62 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
     return rf.peers[server].Call("Raft.AppendEntries", args, reply)
 }
 
+type InstallSnapshotArgs struct {
+    Term                int
+    LeaderId            int
+    LastIncludedIdx     int
+    LastIncludedTerm    int
+    Snapshot            []byte
+}
+
+func (args InstallSnapshotArgs) String() string {
+    return fmt.Sprintf("InstallSnapshotArgs(from %v, term %v, last idx %v, last term %v)",
+            args.LeaderId, args.Term, args.LastIncludedIdx, args.LastIncludedTerm)
+}
+
+type InstallSnapshotReply struct {
+    Term                int
+}
+
+func (rf *Raft) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnapshotReply) {
+    rf.mutex.Lock()
+    defer rf.mutex.Unlock()
+    if args.Term >= rf.Term {
+        assert(rf.commitIdx >= rf.BaseIdx, "%s: commitIdx=%v, BaseIdx=%v", rf, rf.commitIdx, rf.BaseIdx)
+        if args.Term > rf.Term || CANDIDATE == rf.state {
+            rf.stepDown(args.Term, -1)
+        } else {
+            assert(LEADER != rf.state, "%s receives request from %d", rf, args.LeaderId)
+            rf.resetTimer()
+        }
+        if !rf.stop && args.LastIncludedIdx > rf.BaseIdx && (args.LastIncludedIdx >= rf.BaseIdx+len(rf.Log) ||
+                args.LastIncludedTerm == rf.Log[args.LastIncludedIdx-rf.BaseIdx].Term) {
+            if args.LastIncludedIdx < rf.BaseIdx+len(rf.Log) {
+                rf.Log = rf.Log[args.LastIncludedIdx-rf.BaseIdx:]
+            } else {
+                rf.Log = []LogEntry{LogEntry{Term:args.LastIncludedTerm}}
+            }
+            rf.BaseIdx = args.LastIncludedIdx
+            rf.persist()
+            rf.persister.SaveSnapshot(args.Snapshot)
+            if rf.commitIdx < args.LastIncludedIdx {
+                rf.commitIdx = args.LastIncludedIdx
+                msg := ApplyMsg{args.LastIncludedIdx, nil, true, args.Snapshot}
+                rf.msg_q = append(rf.msg_q, msg)
+                if len(rf.msg_q) == 1 {
+                    rf.msg_cond.Broadcast()
+                }
+            }
+            rf.lastApplied = rf.commitIdx
+            assert(rf.commitIdx >= rf.BaseIdx, "%s: commitIdx=%v, BaseIdx=%v", rf, rf.commitIdx, rf.BaseIdx)
+        }
+    }
+    reply.Term = rf.Term
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+    return rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -296,7 +362,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
     rf.mutex.Lock()
     defer rf.mutex.Unlock()
-    index := len(rf.Log)
+    index := rf.BaseIdx+len(rf.Log)
     if LEADER == rf.state {
         rf.Log = append(rf.Log, LogEntry{command, rf.Term})
         rf.persist()
@@ -314,9 +380,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
     rf.mutex.Lock()
-    rf.Term = -1
+    defer rf.mutex.Unlock()
+    rf.stop = true
     rf.state = FOLLOWER
-    rf.mutex.Unlock()
+    rf.persister.Kill()
 }
 
 //
@@ -341,63 +408,105 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rand.Seed(time.Now().UnixNano())
 
     rf.mutex.Lock()
-    rf.timer = time.NewTimer(time.Millisecond * time.Duration(150+rand.Intn(150)))
+    rf.timer = time.NewTimer(time.Duration(ELT_TIMEOUT+rand.Intn(ELT_TIMEOUT)) * time.Millisecond)
+    rf.msg_cond = sync.Cond{L:&rf.mutex}
+    rf.msg_q = []ApplyMsg{}
     rf.applyCh = applyCh
 
-    rf.commitIdx = 0
-    rf.lastApplied = 0
+    // initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
+    rf.stop = false
+    rf.state = FOLLOWER
+    rf.commitIdx = rf.BaseIdx
+    rf.lastApplied = rf.BaseIdx
     rf.nextIdx = make([]int, len(rf.peers))
     rf.matchIdx = make([]int, len(rf.peers))
 
-    rf.VotedFor = -1
-    rf.Log = []LogEntry{LogEntry{Term:0}}
+	rf.mutex.Unlock()
 
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-    rf.mutex.Unlock()
+    DPrintf("Make %s: baseIdx = %d", rf, rf.BaseIdx)
 
     go rf.watchdog()
+
+    go func() {
+        rf.mutex.Lock()
+        defer rf.mutex.Unlock()
+        for !rf.stop {
+            for 0 == len(rf.msg_q) {
+                rf.msg_cond.Wait()
+            }
+            msg := rf.msg_q[0]
+            rf.msg_q = rf.msg_q[1:]
+            rf.mutex.Unlock()
+
+            rf.applyCh <- msg
+
+            rf.mutex.Lock()
+        }
+    }()
 
 	return rf
 }
 
-func (rf *Raft) stepDown(term int, votedFor int) {
-    rf.Term = term
-    rf.VotedFor = votedFor
-    rf.state = FOLLOWER
-    rf.persist()
-    rf.matchIdx[rf.me] = 0
-    rf.resetTimer()
+func (rf *Raft) stepDown(term int, votedFor int) { // Guarded by mutex
+    if !rf.stop {
+        rf.Term = term
+        rf.VotedFor = votedFor
+        rf.state = FOLLOWER
+        rf.persist()
+        rf.resetTimer()
+    }
 }
 
-func (rf *Raft) resetTimer() {
+const ELT_TIMEOUT = 150
+const HB_INTERVAL = 50
+
+func (rf *Raft) resetTimer() { // Guarded by mutex
     switch rf.state {
     case FOLLOWER, CANDIDATE:
-        rf.timer.Reset(time.Millisecond * time.Duration(150+rand.Intn(150)))
+        rf.timer.Reset(time.Duration(ELT_TIMEOUT+rand.Intn(ELT_TIMEOUT)) * time.Millisecond)
     case LEADER:
-        rf.timer.Reset(time.Millisecond * time.Duration(50))
+        rf.timer.Reset(HB_INTERVAL * time.Millisecond)
+    }
+}
+
+func (rf *Raft) apply() { // Guarded by mutex
+    for rf.lastApplied < rf.commitIdx {
+        rf.lastApplied++
+        msg := ApplyMsg{rf.lastApplied, rf.Log[rf.lastApplied-rf.BaseIdx].Command, false, nil}
+        rf.msg_q = append(rf.msg_q, msg)
+        if len(rf.msg_q) == 1 {
+            rf.msg_cond.Broadcast()
+        }
     }
 }
 
 func (rf *Raft) watchdog() {
     for {
+
         <-rf.timer.C
+
         rf.mutex.Lock()
-        switch rf.state {
-        case FOLLOWER:
-            rf.Term++
-            rf.VotedFor = rf.me
-            rf.state = CANDIDATE
-            rf.persist()
-            go rf.broadcastRequestVote(rf.Term)
-        case CANDIDATE:
-            rf.Term++
-            rf.persist()
-            go rf.broadcastRequestVote(rf.Term)
-        case LEADER:
-            go rf.broadcastHeartbeats(rf.Term)
+        if rf.stop {
+            break
+        } else {
+            switch rf.state {
+            case FOLLOWER:
+                rf.Term++
+                rf.VotedFor = rf.me
+                rf.state = CANDIDATE
+                rf.persist()
+                go rf.broadcastRequestVote(rf.Term)
+            case CANDIDATE:
+                rf.Term++
+                rf.persist()
+                go rf.broadcastRequestVote(rf.Term)
+            case LEADER:
+                go rf.broadcastHeartbeats(rf.Term)
+            }
+            rf.resetTimer()
         }
-        rf.resetTimer()
         rf.mutex.Unlock()
     }
 }
@@ -409,26 +518,26 @@ func (rf *Raft) broadcastRequestVote(term int) {
             go func(idx int) {
                 rf.mutex.Lock()
                 defer rf.mutex.Unlock()
-                args := RequestVoteArgs{term, rf.me, len(rf.Log)-1, rf.Log[len(rf.Log)-1].Term}
+                args := RequestVoteArgs{term, rf.me, rf.BaseIdx+len(rf.Log)-1, rf.Log[len(rf.Log)-1].Term}
                 reply := RequestVoteReply{}
-
-                for replied:=false; term == rf.Term && CANDIDATE == rf.state && !replied; {
+                for replied:=false; !rf.stop && term == rf.Term && CANDIDATE == rf.state && !replied; {
                     rf.mutex.Unlock()
+
                     replied = rf.sendRequestVote(idx, args, &reply)
+
                     rf.mutex.Lock()
                 }
-
-                if term == rf.Term && CANDIDATE == rf.state {
+                if !rf.stop && term == rf.Term && CANDIDATE == rf.state {
                     if reply.Term > rf.Term {
                         rf.stepDown(reply.Term, -1)
                     } else if reply.VoteGranted {
                         votes++
                         if votes == len(rf.peers)/2+1 {
+                            DPrintf("LEADER = %s", rf)
                             rf.state = LEADER
                             rf.resetTimer()
-                            //DPrintf("LEADER = %s", rf)
                             for i := range rf.peers {
-                                rf.nextIdx[i] = len(rf.Log)
+                                rf.nextIdx[i] = rf.BaseIdx+len(rf.Log)
                                 rf.matchIdx[i] = 0
                             }
                             go rf.broadcastHeartbeats(rf.Term)
@@ -446,13 +555,34 @@ func (rf *Raft) broadcastHeartbeats(term int) {
             go func(idx int) {
                 rf.mutex.Lock()
                 defer rf.mutex.Unlock()
-                if term == rf.Term {
-                    args := AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1,
-                        rf.Log[rf.nextIdx[idx]-1].Term, []LogEntry{},  rf.commitIdx}
-                    reply := AppendEntriesReply{}
-
+                if rf.stop || term != rf.Term {
+                    return
+                } else if rf.nextIdx[idx] <= rf.BaseIdx {
+                    args := InstallSnapshotArgs{term, rf.me, rf.BaseIdx, rf.Log[0].Term,
+                        rf.persister.ReadSnapshot()}
+                    reply := InstallSnapshotReply{}
                     rf.mutex.Unlock()
+
+                    replied := rf.sendInstallSnapshot(idx, args, &reply)
+
+                    rf.mutex.Lock()
+                    if replied && term == rf.Term {
+                        if rf.Term < reply.Term {
+                            rf.stepDown(reply.Term, -1)
+                        } else if rf.matchIdx[server] < args.LastIncludedIdx {
+                            rf.matchIdx[server] = args.LastIncludedIdx
+                            rf.nextIdx[server] = rf.matchIdx[server]+1
+                        }
+                    }
+                } else {
+                    rf.checkNextIdx(idx)
+                    args := AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1,
+                        rf.Log[rf.nextIdx[idx]-rf.BaseIdx-1].Term, []LogEntry{},  rf.commitIdx}
+                    reply := AppendEntriesReply{}
+                    rf.mutex.Unlock()
+
                     replied := rf.sendAppendEntries(idx, args, &reply)
+
                     rf.mutex.Lock()
                     if replied && term == rf.Term {
                         if reply.Success {
@@ -478,56 +608,91 @@ func (rf *Raft) broadcastAppendEntries(term int) {
             go func(idx int) {
                 rf.mutex.Lock()
                 defer rf.mutex.Unlock()
-                if term == rf.Term {
+                for !rf.stop && term == rf.Term {
+
+                    rf.sendSnapshots(term, idx)
+
+                    if rf.stop || term != rf.Term {
+                        break
+                    }
                     rf.checkNextIdx(idx)
-                    args := AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1, rf.Log[rf.nextIdx[idx]-1].Term,
-                        rf.Log[rf.nextIdx[idx]:],  rf.commitIdx}
+                    args := AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1, rf.Log[rf.nextIdx[idx]-rf.BaseIdx-1].Term,
+                        rf.Log[rf.nextIdx[idx]-rf.BaseIdx:],  rf.commitIdx}
+                    reply := AppendEntriesReply{}
+                    for replied:=false; !rf.stop && term == rf.Term && !replied; {
+                        rf.mutex.Unlock()
 
-                    for stop:=false; !stop; {
-                        stop = true
-                        reply := AppendEntriesReply{}
+                        replied = rf.sendAppendEntries(idx, args, &reply)
 
-                        for replied:=false; term == rf.Term && !replied; {
-                            rf.mutex.Unlock()
-                            replied = rf.sendAppendEntries(idx, args, &reply)
-                            rf.mutex.Lock()
-                        }
-
-                        if term == rf.Term {
-                            if reply.Success {
-                                if rf.matchIdx[idx] < args.PrevLogIdx+len(args.Entries) {
-                                    rf.matchIdx[idx] = args.PrevLogIdx+len(args.Entries)
-                                    rf.nextIdx[idx] = rf.matchIdx[idx]+1
-                                    rf.checkNextIdx(idx)
-                                    if term == rf.Log[rf.matchIdx[idx]].Term && rf.commitIdx < rf.matchIdx[idx] {
-                                        cnt := 1
-                                        for i := range rf.peers {
-                                            if i != rf.me && rf.matchIdx[i] >= rf.matchIdx[idx] {
-                                                cnt++
-                                            }
-                                        }
-                                        if cnt == len(rf.peers)/2+1 {
-                                            rf.commitIdx = rf.matchIdx[idx]
-                                            for rf.lastApplied < rf.commitIdx {
-                                                rf.lastApplied++
-                                                rf.applyCh <- ApplyMsg{rf.lastApplied, rf.Log[rf.lastApplied].Command, false, nil}
-                                            }
-                                        }
+                        rf.mutex.Lock()
+                    }
+                    if rf.stop || term != rf.Term {
+                        break
+                    } else if reply.Success {
+                        if rf.matchIdx[idx] < args.PrevLogIdx+len(args.Entries) {
+                            rf.matchIdx[idx] = args.PrevLogIdx+len(args.Entries)
+                            rf.nextIdx[idx] = rf.matchIdx[idx]+1
+                            if rf.commitIdx < rf.matchIdx[idx] && term == rf.Log[rf.matchIdx[idx]-rf.BaseIdx].Term {
+                                cnt := 1
+                                for i := range rf.peers {
+                                    if i != rf.me && rf.matchIdx[i] >= rf.matchIdx[idx] {
+                                        cnt++
                                     }
                                 }
-                            } else if rf.Term < reply.Term {
-                                rf.stepDown(reply.Term, -1)
-                            } else if args.PrevLogIdx == rf.nextIdx[idx]-1 {
-                                rf.nextIdx[idx] = reply.Index+1
-                                rf.checkNextIdx(idx)
-                                args = AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1, rf.Log[rf.nextIdx[idx]-1].Term,
-                                    rf.Log[rf.nextIdx[idx]:], rf.commitIdx}
-                                stop = false
+                                if cnt == len(rf.peers)/2+1 {
+                                    rf.commitIdx = rf.matchIdx[idx]
+                                    rf.apply()
+                                }
                             }
                         }
+                    } else if rf.Term < reply.Term {
+                        rf.stepDown(reply.Term, -1)
+                    } else if args.PrevLogIdx == rf.nextIdx[idx]-1 {
+                        rf.nextIdx[idx] = reply.Index+1
+                        continue
                     }
+                    break
                 }
             }(server)
         }
+    }
+}
+
+func (rf *Raft) sendSnapshots(term int, server int) {  // Guarded by mutex
+    for !rf.stop && term == rf.Term && rf.nextIdx[server] <= rf.BaseIdx {
+        args := InstallSnapshotArgs{term, rf.me, rf.BaseIdx, rf.Log[0].Term, rf.persister.ReadSnapshot()}
+        reply := InstallSnapshotReply{}
+        rf.mutex.Unlock()
+
+        replied := rf.sendInstallSnapshot(server, args, &reply)
+
+        rf.mutex.Lock()
+        if replied && term == rf.Term {
+            if rf.Term < reply.Term {
+                rf.stepDown(reply.Term, -1)
+            } else {
+                rf.matchIdx[server] = max(rf.matchIdx[server], args.LastIncludedIdx)
+                rf.nextIdx[server] = max(rf.nextIdx[server], rf.matchIdx[server]+1)
+            }
+        }
+    }
+}
+
+func (rf *Raft) CompactOrNot(maxraftstate int) bool {
+    rf.mutex.Lock()
+    defer rf.mutex.Unlock()
+    return maxraftstate >= 0 && rf.persister.RaftStateSize() >= maxraftstate
+}
+
+func (rf *Raft) CompactLog(index int, snapshot []byte) {
+    rf.mutex.Lock()
+    defer rf.mutex.Unlock()
+    assert(index <= rf.lastApplied, "%s: index = %d, lastApplied = %d", rf, index, rf.lastApplied)
+    if !rf.stop && index > rf.BaseIdx {
+        //DPrintf("%s compacts log at index %d", rf, index)
+        rf.Log = rf.Log[index-rf.BaseIdx:]
+        rf.BaseIdx = index
+        rf.persist()
+        rf.persister.SaveSnapshot(snapshot)
     }
 }

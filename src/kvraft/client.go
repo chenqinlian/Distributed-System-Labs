@@ -8,7 +8,7 @@ import "math/big"
 type Clerk struct {
 	servers         []*labrpc.ClientEnd
 	// You will have to modify this struct.
-    lastReply       int64
+    nextRequest     int64
     leaderIdx       int
 }
 
@@ -19,18 +19,11 @@ func nrand() int64 {
 	return x
 }
 
-func randId() int64 {
-    if val := nrand(); val != 0 {
-        return val
-    }
-    return randId()
-}
-
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-    ck.lastReply = 0
+    ck.nextRequest = nrand()
     ck.leaderIdx = 0
 	return ck
 }
@@ -49,11 +42,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
-    args := GetArgs{key, randId(), ck.lastReply}
+    args := GetArgs{Key:key, Id:ck.nextRequest}
+    ck.nextRequest++
     for {
         reply := GetReply{}
         if ck.servers[ck.leaderIdx].Call("RaftKV.Get", &args, &reply) && !reply.WrongLeader {
-            ck.lastReply = args.Id
             return reply.Value
         } else {
             ck.leaderIdx = (ck.leaderIdx+1)%len(ck.servers)
@@ -73,12 +66,12 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-    args := PutAppendArgs{key, value, op, randId(), ck.lastReply}
+    args := PutAppendArgs{Key:key, Value:value, Op:op, Id:ck.nextRequest}
+    ck.nextRequest++
     for {
         reply := PutAppendReply{}
-        if ck.servers[ck.leaderIdx].Call("RaftKV.PutAppend", &args, &reply) && !reply.WrongLeader{
-            ck.lastReply = args.Id
-            break
+        if ck.servers[ck.leaderIdx].Call("RaftKV.PutAppend", &args, &reply) && !reply.WrongLeader {
+            return
         } else {
             ck.leaderIdx = (ck.leaderIdx+1)%len(ck.servers)
         }

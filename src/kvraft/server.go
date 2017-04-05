@@ -8,9 +8,10 @@ import (
 	"sync"
     "time"
     "fmt"
+    "bytes"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -19,7 +20,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-func Assert(statement bool, format string, a ...interface{}) {
+func assert(statement bool, format string, a ...interface{}) {
     if !statement {
         DPrintf(format, a...)
         panic("Assertion Failed")
@@ -30,7 +31,6 @@ const (
     GET     = "Get"
     PUT     = "Put"
     APPEND  = "Append"
-    QUIT    = "Quit"
 )
 
 type OpType string
@@ -45,7 +45,6 @@ type Op struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
     Id          int64
-    Prev        int64
     Leader      int
     Type        OpType
     Key         string
@@ -56,13 +55,11 @@ type Op struct {
 func (op Op) String() string {
     switch op.Type {
     case GET:
-        return fmt.Sprintf("%d_%s(%s)", op.Id, op.Type, op.Key)
+        return fmt.Sprintf("Op_%d_%s(%s)", op.Id, op.Type, op.Key)
     case PUT:
-        return fmt.Sprintf("%d_%s(%s, %s)", op.Id, op.Type, op.Key, op.Value)
+        return fmt.Sprintf("Op_%d_%s(%s, %s)", op.Id, op.Type, op.Key, op.Value)
     case APPEND:
-        return fmt.Sprintf("%d_%s(%s, %s)", op.Id, op.Type, op.Key, op.Value)
-    case QUIT:
-        return fmt.Sprintf("%d_%s", op.Id, op.Type)
+        return fmt.Sprintf("Op_%d_%s(%s, %s)", op.Id, op.Type, op.Key, op.Value)
     }
     return "Unknown Op"
 }
@@ -76,46 +73,91 @@ type RaftKV struct {
 	maxraftstate    int // snapshot if log grows this big
 
 	// Your definitions here.
-    mem             map[string] string
-    results         map[int64] Result
+    stop            bool
+
+    Index           int
+    Mem             map[string] string
+    Results         map[int64] Result
 }
 
+func (kv RaftKV) String() string {
+    return fmt.Sprintf("Server_%d", kv.me)
+}
+
+func (kv *RaftKV) compactLog() { // Guarded by mutex
+    if !kv.stop && kv.rf.CompactOrNot(kv.maxraftstate/4) {
+        buffer := new(bytes.Buffer)
+        encoder := gob.NewEncoder(buffer)
+        encoder.Encode(kv.Index)
+        encoder.Encode(kv.Mem)
+        encoder.Encode(kv.Results)
+        kv.rf.CompactLog(kv.Index, buffer.Bytes())
+    }
+}
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-    op := Op{Id:args.Id, Prev:args.Prev, Leader:kv.me, Type:GET, Key:args.Key, Ch:make(chan Result)}
-    for {
-        if _, _, ok := kv.rf.Start(op); ok {
-            select {
-            case result := <-op.Ch:
-                reply.Value = result.Value
-                reply.Err = result.Err
-                reply.WrongLeader = false
-                return
-            case <-time.NewTimer(1000*time.Millisecond).C:
+    op := Op{Id:args.Id, Leader:kv.me, Type:GET, Key:args.Key, Ch:make(chan Result)}
+    kv.mutex.Lock()
+    defer kv.mutex.Unlock()
+    if result, cached := kv.Results[op.Id]; cached {
+        reply.Value = result.Value
+        reply.Err = result.Err
+        reply.WrongLeader = false   // Just pass up as the leader
+    } else {
+        for !kv.stop {
+            if _, _, ok := kv.rf.Start(op); ok {
+                //kv.compactLog()
+                kv.mutex.Unlock()
+
+                select {
+                case result = <-op.Ch:
+                    reply.Value = result.Value
+                    reply.Err = result.Err
+                    reply.WrongLeader = false
+
+                    kv.mutex.Lock()
+                    return
+                case <-time.NewTimer(1000*time.Millisecond).C:
+                    kv.mutex.Lock()
+                }
+            } else {
+                reply.WrongLeader = true
+                break
             }
-        } else {
-            reply.WrongLeader = true
-            break
         }
     }
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-    op := Op{args.Id, args.Prev, kv.me, OpType(args.Op), args.Key, args.Value, make(chan Result)}
-    for {
-        if _, _, ok := kv.rf.Start(op); ok {
-            select {
-            case result := <-op.Ch:
-                reply.Err = result.Err
-                reply.WrongLeader = false
-                return
-            case <-time.NewTimer(1000*time.Millisecond).C:
+    op := Op{Id:args.Id, Leader:kv.me, Type:OpType(args.Op),
+        Key:args.Key, Value:args.Value, Ch:make(chan Result)}
+    kv.mutex.Lock()
+    defer kv.mutex.Unlock()
+    if result, cached := kv.Results[op.Id]; cached {
+        reply.Err = result.Err
+        reply.WrongLeader = false   // Just pass up as the leader
+    } else {
+        for !kv.stop {
+            if _, _, ok := kv.rf.Start(op); ok {
+                //kv.compactLog()
+                kv.mutex.Unlock()
+
+                select {
+                case result := <-op.Ch:
+                    reply.Err = result.Err
+                    reply.WrongLeader = false
+
+                    kv.mutex.Lock()
+                    return
+                case <-time.NewTimer(1000*time.Millisecond).C:
+                    kv.mutex.Lock()
+                }
+            } else {
+                reply.WrongLeader = true
+                break
             }
-        } else {
-            reply.WrongLeader = true
-            break
         }
     }
 }
@@ -127,10 +169,14 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // turn off debug output from this instance.
 //
 func (kv *RaftKV) Kill() {
-	kv.rf.Kill()
+    DPrintf("Kill %s", kv)
 	// Your code here, if desired.
-    kv.applyCh <- raft.ApplyMsg{Command:Op{Type:QUIT}}
+    kv.mutex.Lock()
+    defer kv.mutex.Unlock()
+    kv.stop = true
+	kv.rf.Kill()
 }
+
 
 //
 // servers[] contains the ports of the set of
@@ -159,54 +205,96 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
     kv.mutex.Lock()
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-    kv.mem = make(map[string] string)
-    kv.results = make(map[int64] Result)
+    kv.stop = false
+
+    snapshot := persister.ReadSnapshot()
+    if 0 == len(snapshot) {
+        kv.Index = 0
+        kv.Mem = make(map[string] string)
+        kv.Results = make(map[int64] Result)
+    } else {
+        buffer := bytes.NewBuffer(snapshot)
+        decoder := gob.NewDecoder(buffer)
+        decoder.Decode(&kv.Index)
+        decoder.Decode(&kv.Mem)
+        decoder.Decode(&kv.Results)
+    }
+    DPrintf("Make %s: index = %d", kv, kv.Index)
     kv.mutex.Unlock()
 
     go kv.service()
 
+    /*
+    go func() {
+        kv.mutex.Lock()
+        defer kv.mutex.Unlock()
+        for !kv.stop {
+            kv.compactLog()
+            kv.mutex.Unlock()
+
+            time.Sleep(10*time.Millisecond)
+
+            kv.mutex.Lock()
+        }
+    }()
+    */
+
 	return kv
 }
 
-
 func (kv *RaftKV) service() {
-    for stop:=false; !stop; {
+    kv.mutex.Lock()
+    defer kv.mutex.Unlock()
+    for !kv.stop {
+        kv.mutex.Unlock()
+
         msg := <-kv.applyCh
-        if op, ok:= msg.Command.(Op); ok {
-            //DPrintf("%s applies %s", kv.rf, op)
-            kv.mutex.Lock()
-            if op.Prev > 0 {
-                delete(kv.results, op.Prev)
-            }
-            if _, ok := kv.results[op.Id]; !ok {
+
+        kv.mutex.Lock()
+        if msg.UseSnapshot && kv.Index < msg.Index {
+            DPrintf("%s applies a snapshot at index %v", kv, msg.Index)
+            buffer := bytes.NewBuffer(msg.Snapshot)
+            decoder := gob.NewDecoder(buffer)
+            decoder.Decode(&kv.Index)
+            decoder.Decode(&kv.Mem)
+            decoder.Decode(&kv.Results)
+        }
+        if op, ok := msg.Command.(Op); ok {
+            if _, cached := kv.Results[op.Id]; !cached && msg.Index > kv.Index {
+                DPrintf("%s applies %s at index %v", kv.rf, op, msg.Index)
+                kv.Index = msg.Index
                 switch op.Type {
                 case GET:
-                    if val,ok := kv.mem[op.Key]; ok {
-                        kv.results[op.Id] = Result{OK, val}
+                    if val,ok := kv.Mem[op.Key]; ok {
+                        kv.Results[op.Id] = Result{OK, val}
                     } else {
-                        kv.results[op.Id] = Result{ErrNoKey, ""}
+                        kv.Results[op.Id] = Result{ErrNoKey, ""}
                     }
                 case PUT:
-                    kv.mem[op.Key] = op.Value
-                    kv.results[op.Id] = Result{OK, kv.mem[op.Key]}
+                    kv.Mem[op.Key] = op.Value
+                    kv.Results[op.Id] = Result{OK, kv.Mem[op.Key]}
                 case APPEND:
-                    if val,ok := kv.mem[op.Key]; ok {
-                        kv.mem[op.Key] = val+op.Value
+                    if val,ok := kv.Mem[op.Key]; ok {
+                        kv.Mem[op.Key] = val+op.Value
                     } else {
-                        kv.mem[op.Key] = op.Value
+                        kv.Mem[op.Key] = op.Value
                     }
-                    kv.results[op.Id] = Result{OK, kv.mem[op.Key]}
-                case QUIT:
-                    stop = true
+                    kv.Results[op.Id] = Result{OK, kv.Mem[op.Key]}
                 }
+                kv.compactLog()
             }
             if kv.me == op.Leader {
+                result := kv.Results[op.Id]
+                kv.mutex.Unlock()
+
                 select {
-                case op.Ch <- kv.results[op.Id]:
+                case op.Ch <- result:
                 case <-time.NewTimer(20*time.Millisecond).C:
                 }
+
+                kv.mutex.Lock()
             }
-            kv.mutex.Unlock()
         }
     }
 }
+

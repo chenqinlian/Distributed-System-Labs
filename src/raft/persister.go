@@ -17,6 +17,13 @@ type Persister struct {
 	snapshot  []byte
 }
 
+func (ps *Persister) Kill() {
+    ps.mu.Lock()
+    defer ps.mu.Unlock()
+    ps.raftstate = nil
+    ps.snapshot = nil
+}
+
 func MakePersister() *Persister {
 	return &Persister{}
 }
