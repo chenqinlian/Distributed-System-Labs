@@ -1,5 +1,8 @@
 package shardmaster
 
+import "log"
+import "fmt"
+
 //
 // Master shard server: assigns shards to replication groups.
 //
@@ -31,6 +34,21 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (config Config) String() string {
+    str :=  fmt.Sprintf("Num = %d\n", config.Num)
+    for i, gid := range config.Shards {
+        str += fmt.Sprintf("Shard[%d] = %d\n", i, gid)
+    }
+    for gid, servers := range config.Groups {
+        val := ""
+        for _, server := range servers {
+            val += server+" "
+        }
+        str += fmt.Sprintf("Group[%d] = %s\n", gid, val)
+    }
+    return str
+}
+
 const (
 	OK = "OK"
 )
@@ -39,6 +57,7 @@ type Err string
 
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+    Seq     int64
 }
 
 type JoinReply struct {
@@ -48,6 +67,7 @@ type JoinReply struct {
 
 type LeaveArgs struct {
 	GIDs []int
+    Seq  int64
 }
 
 type LeaveReply struct {
@@ -58,6 +78,7 @@ type LeaveReply struct {
 type MoveArgs struct {
 	Shard int
 	GID   int
+    Seq   int64
 }
 
 type MoveReply struct {
@@ -67,6 +88,7 @@ type MoveReply struct {
 
 type QueryArgs struct {
 	Num int // desired config number
+    Seq int64
 }
 
 type QueryReply struct {
@@ -74,3 +96,22 @@ type QueryReply struct {
 	Err         Err
 	Config      Config
 }
+
+// Debugging
+const Debug = 1
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+func assert(statement bool, format string, a ...interface{}) {
+    if !statement {
+        DPrintf(format, a...)
+        panic("Assertion Failed")
+    }
+}
+
+
