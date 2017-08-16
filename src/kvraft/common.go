@@ -1,5 +1,7 @@
 package raftkv
 
+import "log"
+
 const (
 	OK       = "OK"
 	ErrNoKey = "ErrNoKey"
@@ -34,4 +36,22 @@ type GetReply struct {
 	WrongLeader bool
 	Err         Err
 	Value       string
+}
+
+// Debugging
+
+const Debug = 0
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+func assert(statement bool, format string, a ...interface{}) {
+    if !statement {
+        DPrintf(format, a...)
+        panic("Assertion Failed")
+    }
 }

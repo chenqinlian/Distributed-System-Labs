@@ -37,15 +37,22 @@ func (ck *Clerk) Query(num int) Config {
     args.Seq = ck.nextRequest
     ck.nextRequest++
 
-	for {
+    for {
 		// try each known server.
+        cnt := 0
 		for _, srv := range ck.servers {
 			var reply QueryReply
-			ok := srv.Call("ShardMaster.Query", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return reply.Config
-			}
+			if ok := srv.Call("ShardMaster.Query", args, &reply); ok {
+                if !reply.WrongLeader {
+                    return reply.Config
+                }
+                cnt++
+            }
+
 		}
+        if cnt == 0 {
+            return Config{Groups:make(map[int][]string)}
+        }
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -57,15 +64,21 @@ func (ck *Clerk) Join(servers map[int][]string) {
     args.Seq = ck.nextRequest
     ck.nextRequest++
 
-	for {
+    for {
 		// try each known server.
+        cnt := 0
 		for _, srv := range ck.servers {
 			var reply JoinReply
-			ok := srv.Call("ShardMaster.Join", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+			if ok := srv.Call("ShardMaster.Join", args, &reply); ok {
+                if !reply.WrongLeader {
+                    return
+                }
+                cnt++
+            }
 		}
+        if cnt < (len(ck.servers)+1)/2 {
+            return
+        }
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -77,15 +90,21 @@ func (ck *Clerk) Leave(gids []int) {
     args.Seq = ck.nextRequest
     ck.nextRequest++
 
-	for {
+    for {
 		// try each known server.
+        cnt := 0
 		for _, srv := range ck.servers {
 			var reply LeaveReply
-			ok := srv.Call("ShardMaster.Leave", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+			if ok := srv.Call("ShardMaster.Leave", args, &reply); ok {
+                if !reply.WrongLeader {
+                    return
+                }
+                cnt++
+            }
 		}
+        if cnt < (len(ck.servers)+1)/2 {
+            return
+        }
 		time.Sleep(100 * time.Millisecond)
 	}
 }
@@ -98,15 +117,21 @@ func (ck *Clerk) Move(shard int, gid int) {
     args.Seq = ck.nextRequest
     ck.nextRequest++
 
-	for {
+    for {
 		// try each known server.
+        cnt := 0
 		for _, srv := range ck.servers {
 			var reply MoveReply
-			ok := srv.Call("ShardMaster.Move", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
+			if ok := srv.Call("ShardMaster.Move", args, &reply); ok {
+                if !reply.WrongLeader {
+                    return
+                }
+                cnt++
+            }
 		}
+        if cnt < (len(ck.servers)+1)/2 {
+            return
+        }
 		time.Sleep(100 * time.Millisecond)
 	}
 }

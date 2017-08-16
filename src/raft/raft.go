@@ -82,6 +82,7 @@ type Raft struct {
     msg_q           []ApplyMsg
     applyCh         chan ApplyMsg
     stop            bool
+    backoff         uint
 
     Term            int
     VotedFor        int
@@ -422,10 +423,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.lastApplied = rf.BaseIdx
     rf.nextIdx = make([]int, len(rf.peers))
     rf.matchIdx = make([]int, len(rf.peers))
-
-	rf.mutex.Unlock()
+    rf.backoff = 0
 
     DPrintf("Make %s: baseIdx = %d", rf, rf.BaseIdx)
+	rf.mutex.Unlock()
 
     go rf.watchdog()
 
@@ -463,9 +464,16 @@ const ELT_TIMEOUT = 150
 const HB_INTERVAL = 50
 
 func (rf *Raft) resetTimer() { // Guarded by mutex
+    if CANDIDATE == rf.state {
+        rf.backoff++
+    } else {
+        rf.backoff = 0
+    }
     switch rf.state {
-    case FOLLOWER, CANDIDATE:
+    case FOLLOWER:
         rf.timer.Reset(time.Duration(ELT_TIMEOUT+rand.Intn(ELT_TIMEOUT)) * time.Millisecond)
+    case CANDIDATE:
+        rf.timer.Reset(time.Duration(rand.Intn((1<<rf.backoff)*ELT_TIMEOUT)) * time.Millisecond)
     case LEADER:
         rf.timer.Reset(HB_INTERVAL * time.Millisecond)
     }
@@ -552,18 +560,18 @@ func (rf *Raft) broadcastRequestVote(term int) {
 func (rf *Raft) broadcastHeartbeats(term int) {
     for server := range rf.peers {
         if server != rf.me {
-            go func(idx int) {
+            go func(server int) {
                 rf.mutex.Lock()
                 defer rf.mutex.Unlock()
                 if rf.stop || term != rf.Term {
                     return
-                } else if rf.nextIdx[idx] <= rf.BaseIdx {
+                } else if rf.nextIdx[server] <= rf.BaseIdx {
                     args := InstallSnapshotArgs{term, rf.me, rf.BaseIdx, rf.Log[0].Term,
                         rf.persister.ReadSnapshot()}
                     reply := InstallSnapshotReply{}
                     rf.mutex.Unlock()
 
-                    replied := rf.sendInstallSnapshot(idx, args, &reply)
+                    replied := rf.sendInstallSnapshot(server, args, &reply)
 
                     rf.mutex.Lock()
                     if replied && term == rf.Term {
@@ -575,25 +583,25 @@ func (rf *Raft) broadcastHeartbeats(term int) {
                         }
                     }
                 } else {
-                    rf.checkNextIdx(idx)
-                    args := AppendEntriesArgs{term, rf.me, rf.nextIdx[idx]-1,
-                        rf.Log[rf.nextIdx[idx]-rf.BaseIdx-1].Term, []LogEntry{},  rf.commitIdx}
+                    rf.checkNextIdx(server)
+                    args := AppendEntriesArgs{term, rf.me, rf.nextIdx[server]-1,
+                        rf.Log[rf.nextIdx[server]-rf.BaseIdx-1].Term, []LogEntry{},  rf.commitIdx}
                     reply := AppendEntriesReply{}
                     rf.mutex.Unlock()
 
-                    replied := rf.sendAppendEntries(idx, args, &reply)
+                    replied := rf.sendAppendEntries(server, args, &reply)
 
                     rf.mutex.Lock()
                     if replied && term == rf.Term {
                         if reply.Success {
-                            if rf.matchIdx[idx] < args.PrevLogIdx {
-                                rf.matchIdx[idx] = args.PrevLogIdx
-                                rf.nextIdx[idx] = args.PrevLogIdx+1
+                            if rf.matchIdx[server] < args.PrevLogIdx {
+                                rf.matchIdx[server] = args.PrevLogIdx
+                                rf.nextIdx[server] = args.PrevLogIdx+1
                             }
                         } else if rf.Term < reply.Term {
                             rf.stepDown(reply.Term, -1)
-                        } else if args.PrevLogIdx == rf.nextIdx[idx]-1 {
-                            rf.nextIdx[idx] = reply.Index+1
+                        } else if args.PrevLogIdx == rf.nextIdx[server]-1 {
+                            rf.nextIdx[server] = reply.Index+1
                         }
                     }
                 }
@@ -681,7 +689,7 @@ func (rf *Raft) sendSnapshots(term int, server int) {  // Guarded by mutex
 func (rf *Raft) CompactOrNot(maxraftstate int) bool {
     rf.mutex.Lock()
     defer rf.mutex.Unlock()
-    return maxraftstate >= 0 && rf.persister.RaftStateSize() >= maxraftstate
+    return maxraftstate >= 0 && rf.persister.RaftStateSize() >= maxraftstate/4
 }
 
 func (rf *Raft) CompactLog(index int, snapshot []byte) {
@@ -696,3 +704,10 @@ func (rf *Raft) CompactLog(index int, snapshot []byte) {
         rf.persister.SaveSnapshot(snapshot)
     }
 }
+
+func (rf *Raft) IsLeader() bool {
+    rf.mutex.Lock()
+    defer rf.mutex.Unlock()
+    return rf.state == LEADER
+}
+

@@ -3,29 +3,12 @@ package raftkv
 import (
 	"encoding/gob"
 	"labrpc"
-	"log"
 	"raft"
 	"sync"
     "time"
     "fmt"
     "bytes"
 )
-
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
-
-func assert(statement bool, format string, a ...interface{}) {
-    if !statement {
-        DPrintf(format, a...)
-        panic("Assertion Failed")
-    }
-}
 
 const (
     GET     = "Get"
@@ -85,7 +68,7 @@ func (kv RaftKV) String() string {
 }
 
 func (kv *RaftKV) compactLog() { // Guarded by mutex
-    if !kv.stop && kv.rf.CompactOrNot(kv.maxraftstate/4) {
+    if !kv.stop && kv.rf.CompactOrNot(kv.maxraftstate) {
         buffer := new(bytes.Buffer)
         encoder := gob.NewEncoder(buffer)
         encoder.Encode(kv.Index)
@@ -169,10 +152,10 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // turn off debug output from this instance.
 //
 func (kv *RaftKV) Kill() {
-    DPrintf("Kill %s", kv)
 	// Your code here, if desired.
     kv.mutex.Lock()
     defer kv.mutex.Unlock()
+    DPrintf("Kill %s", kv)
     kv.stop = true
 	kv.rf.Kill()
 }
@@ -208,11 +191,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
     kv.stop = false
 
     snapshot := persister.ReadSnapshot()
-    if 0 == len(snapshot) {
-        kv.Index = 0
-        kv.Mem = make(map[string] string)
-        kv.Results = make(map[int64] Result)
-    } else {
+    kv.Index = 0
+    kv.Mem = make(map[string] string)
+    kv.Results = make(map[int64] Result)
+    if len(snapshot) > 0 {
         buffer := bytes.NewBuffer(snapshot)
         decoder := gob.NewDecoder(buffer)
         decoder.Decode(&kv.Index)
@@ -261,7 +243,7 @@ func (kv *RaftKV) service() {
         }
         if op, ok := msg.Command.(Op); ok {
             if _, cached := kv.Results[op.Id]; !cached && msg.Index > kv.Index {
-                DPrintf("%s applies %s at index %v", kv.rf, op, msg.Index)
+                DPrintf("%s applies %s at index %v", kv, op, msg.Index)
                 kv.Index = msg.Index
                 switch op.Type {
                 case GET:

@@ -49,6 +49,20 @@ func (config Config) String() string {
     return str
 }
 
+func CopyConfig(src *Config, dest *Config) {
+    dest.Num = src.Num
+    for shard, gid := range src.Shards {
+        dest.Shards[shard] = gid
+    }
+    dest.Groups = make(map[int][]string)
+    for gid, servers := range src.Groups {
+        dest.Groups[gid] = make([]string, 0, len(servers))
+        for _, server := range servers {
+            dest.Groups[gid] = append(dest.Groups[gid], server)
+        }
+    }
+}
+
 const (
 	OK = "OK"
 )
@@ -98,7 +112,7 @@ type QueryReply struct {
 }
 
 // Debugging
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {

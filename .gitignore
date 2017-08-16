@@ -2,3 +2,4 @@ pkg/
 pdf/
 api.key
 *-handin.tar.gz
+*.log

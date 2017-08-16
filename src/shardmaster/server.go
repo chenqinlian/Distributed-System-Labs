@@ -6,6 +6,8 @@ import "raft"
 import "labrpc"
 import "sync"
 import "encoding/gob"
+import "fmt"
+import "sort"
 
 
 type ShardMaster struct {
@@ -19,6 +21,10 @@ type ShardMaster struct {
 	configs []Config // indexed by config num
     dead    bool
     cache   map[int64]*Config
+}
+
+func (sm ShardMaster) String() string {
+    return fmt.Sprintf("shardMaster_%d", sm.me)
 }
 
 const (
@@ -41,6 +47,23 @@ type Op struct {
     Ch          chan interface{}
 }
 
+func (op Op) Seq() int64 {
+    switch op.Type {
+    case JOIN:
+        return op.JoinArgs.Seq
+    case LEAVE:
+        return op.LeaveArgs.Seq
+    case MOVE:
+        return op.MoveArgs.Seq
+    case QUERY:
+        return op.QueryArgs.Seq
+    }
+    return -1
+}
+
+func (op Op) String() string {
+    return fmt.Sprintf("Op:%s_%d", op.Type, op.Seq())
+}
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
@@ -136,7 +159,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
     defer sm.mutex.Unlock()
     if config, cached := sm.cache[args.Seq]; cached {
         reply.WrongLeader = false
-        reply.Config = *config
+        CopyConfig(config, &reply.Config)
         return
     }
     op := Op{Type:QUERY, QueryArgs:*args, Leader:sm.me, Ch:make(chan interface{})}
@@ -146,10 +169,9 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 
             select {
             case <-op.Ch:
-                reply.WrongLeader = false
-                reply.Config = *sm.cache[args.Seq]
-
                 sm.mutex.Lock()
+                reply.WrongLeader = false
+                CopyConfig(sm.cache[args.Seq], &reply.Config)
                 return
             case <-time.NewTimer(1000*time.Millisecond).C:
                 sm.mutex.Lock()
@@ -159,7 +181,6 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
             break
         }
     }
-
 }
 
 
@@ -222,6 +243,7 @@ func (sm *ShardMaster) service() {
 
         sm.mutex.Lock()
         if op, ok := msg.Command.(Op); ok {
+            DPrintf("%s applies %s", sm, op)
             switch op.Type {
             case JOIN:
                 sm.join(&op.JoinArgs)
@@ -280,16 +302,10 @@ func (sm *ShardMaster) move(args *MoveArgs) {
 }
 
 func (sm *ShardMaster) newConfig() *Config {
-    config := &sm.configs[len(sm.configs)-1]
-    nConfig := Config{Num:config.Num+1}
-    for shard, gid := range config.Shards {
-        nConfig.Shards[shard] = gid
-    }
-    nConfig.Groups = make(map[int][]string)
-    for gid, servers := range config.Groups {
-        nConfig.Groups[gid] = servers
-    }
-    sm.configs = append(sm.configs, nConfig)
+    config := new(Config)
+    CopyConfig(&sm.configs[len(sm.configs)-1], config)
+    config.Num++
+    sm.configs = append(sm.configs, *config)
     return &sm.configs[len(sm.configs)-1]
 }
 
@@ -304,6 +320,7 @@ func (sm *ShardMaster) rebalance() {
     if len(gids) == 0 {
         return
     }
+    sort.Ints(gids)
     for shard, gid := range config.Shards {
         if gid > 0 {
             groups[gid] = append(groups[gid], shard)
